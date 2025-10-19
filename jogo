@@ -1,0 +1,395 @@
+<!doctype html>
+<html lang="pt-PT">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Mini Sonic (com sprite do Mario animado)</title>
+<style>
+  html,body{height:100%;margin:0;background:linear-gradient(#80d0ff,#e6f9ff);}
+  canvas{display:block;margin:0 auto;background:linear-gradient(#66cc66,#2e8b57);box-shadow:0 8px 24px rgba(0,0,0,0.25);border-radius:8px;}
+  #ui{font-family:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial;color:#fff;text-align:center;margin-top:8px;}
+  #info{color:#222;font-weight:600;margin-top:6px;}
+</style>
+</head>
+<body>
+<canvas id="game" width="960" height="540"></canvas>
+<div id="ui">
+  <div>Controles: ← / → para mover, Espaço / ↑ para pular. Colete anéis! (Mario por cima do motor do Sonic)</div>
+  <div id="info">Anéis: <span id="score">0</span></div>
+</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+
+  // --- CONFIG: coloca aqui o caminho/URL do spritesheet do Mario (Super Mario World animado).
+  // Se preferires, deixa "mario.png" e coloca esse ficheiro no mesmo directório do HTML.
+  // Ex.: const SPRITE_SRC = 'https://example.com/path/to/smw-mario.png'
+  const SPRITE_SRC = 'mario.png';
+
+  // --- Mundo & Camera ---
+  const world = { width: 4000, height: 1000 };
+  let cameraX = 0;
+
+  // --- Jogador (agora Mario visualmente, comportamento Sonic) ---
+  const player = {
+    x: 100, y: 200, vx: 0, vy: 0,
+    w: 40, h: 48,
+    onGround: false, facing: 1,
+    spriteState: 'idle' // idle, run, jump
+  };
+
+  // Física (valores pensados para sensação "Sonic-like" com aceleração)
+  const GRAVITY = 1600;
+  const MOVE_ACCEL = 2200;     // aceleração quando pressiona
+  const MAX_SPEED = 700;       // velocidade máxima alta (Sonic feel)
+  const FRICTION = 2000;
+  const JUMP_V = -650;
+
+  // Plataformas
+  const platforms = [
+    {x:0, y:420, w:1200, h:80},
+    {x:1400, y:360, w:220, h:24},
+    {x:1700, y:280, w:160, h:24},
+    {x:2000, y:360, w:300, h:24},
+    {x:2500, y:300, w:200, h:24},
+    {x:2900, y:380, w:800, h:24},
+    {x:360, y:300, w:160, h:24},
+    {x:600, y:240, w:120, h:24}
+  ];
+
+  // Anéis
+  const rings = [];
+  function spawnRings() {
+    const positions = [
+      [380, 260],[640,200],[1500,320],[1740,240],[2100,320],[2540,260],[2950,340],[3200,320],[3450,320]
+    ];
+    positions.forEach(p => rings.push({x:p[0], y:p[1], r:10, taken:false}));
+  }
+  spawnRings();
+
+  // Inimigos: simples "patrol" que mata se tocar
+  const enemies = [];
+  function spawnEnemies() {
+    // cada inimigo: x, y, w, h, dir, speed, alive
+    enemies.push({x:900, y: 380 - 32, w:36, h:24, dir:1, speed:60, alive:true});
+    enemies.push({x:1800, y: 320 - 32, w:36, h:24, dir:-1, speed:80, alive:true});
+    enemies.push({x:2680, y: 260 - 32, w:36, h:24, dir:1, speed:70, alive:true});
+  }
+  spawnEnemies();
+
+  let score = 0;
+  const scoreEl = document.getElementById('score');
+
+  // Input
+  const keys = {};
+  window.addEventListener('keydown', e => {
+    keys[e.code] = true;
+    if (["ArrowUp","ArrowDown","ArrowLeft","ArrowRight","Space"].includes(e.code)) e.preventDefault();
+  });
+  window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+  // --- Spritesheet Mario (animado) ---
+  const marioImg = new Image();
+  marioImg.src = SPRITE_SRC;
+  let spriteReady = false;
+  marioImg.onload = () => { spriteReady = true; };
+
+  // NOTE: as spritesheets variam. Abaixo defino um conjunto de parâmetros genéricos.
+  // Se o teu mario.png tem outra disposição, altera frameW/frameH e as rects.
+  const frameW = 32;   // largura de um quadro no spritesheet
+  const frameH = 32;   // altura de um quadro no spritesheet
+  const sheetScale = 1.6; // escala para ajustar ao tamanho do player (ajusta se necessário)
+
+  // Definição de animações (assumindo que frames estão em linha: run frames 0..3, jump:4, idle:0)
+  const anims = {
+    idle: {row:0, frames:[0], fps:1, loop:true},
+    run:  {row:0, frames:[1,2,3,2], fps:12, loop:true},
+    jump: {row:0, frames:[4], fps:1, loop:false}
+  };
+  let animTimer = 0;
+  let animFrame = 0;
+
+  function playAnim(name, dt) {
+    const a = anims[name];
+    if (!a) return;
+    animTimer += dt;
+    const frameDur = 1 / a.fps;
+    if (animTimer >= frameDur) {
+      animTimer -= frameDur;
+      animFrame = (animFrame + 1) % a.frames.length;
+    }
+    return a.frames[animFrame];
+  }
+
+  // --- Helpers de colisão ---
+  function rectsOverlap(a,b) {
+    return !(a.x + a.w < b.x || a.x > b.x + b.w || a.y + a.h < b.y || a.y > b.y + b.h);
+  }
+
+  function resolveCollisions(dt) {
+    player.onGround = false;
+    // vertical
+    const nextY = player.y + player.vy * dt;
+    for (const p of platforms) {
+      const playerRectNext = {x: player.x, y: nextY, w: player.w, h: player.h};
+      const platformRect = {x:p.x, y:p.y, w:p.w, h:p.h};
+      if (rectsOverlap(playerRectNext, platformRect)) {
+        if (player.vy > 0 && (player.y + player.h) <= p.y + 20) {
+          player.y = p.y - player.h; player.vy = 0; player.onGround = true;
+        } else if (player.vy < 0) {
+          player.y = p.y + p.h; player.vy = 0;
+        }
+      }
+    }
+    if (!player.onGround && !(player.y === nextY)) player.y = nextY;
+
+    // horizontal
+    const nextX = player.x + player.vx * dt;
+    for (const p of platforms) {
+      const playerRectNext = {x: nextX, y: player.y, w: player.w, h: player.h};
+      const platformRect = {x:p.x, y:p.y, w:p.w, h:p.h};
+      if (rectsOverlap(playerRectNext, platformRect)) {
+        if (player.vx > 0) { player.x = p.x - player.w; player.vx = 0; }
+        else if (player.vx < 0) { player.x = p.x + p.w; player.vx = 0; }
+      }
+    }
+    if (player.vx !== 0) player.x = nextX;
+
+    // limites mundo
+    if (player.x < 0) { player.x = 0; player.vx = 0; }
+    if (player.x + player.w > world.width) { player.x = world.width - player.w; player.vx = 0; }
+    if (player.y > world.height) {
+      // respawn
+      player.x = 100; player.y = 200; player.vx = 0; player.vy = 0;
+      score = Math.max(0, score - 5); updateScore();
+    }
+  }
+
+  // colecionar anéis
+  function collectRings() {
+    for (const r of rings) {
+      if (r.taken) continue;
+      const dx = (player.x + player.w/2) - r.x;
+      const dy = (player.y + player.h/2) - r.y;
+      const dist2 = dx*dx + dy*dy;
+      if (dist2 < (r.r + Math.max(player.w,player.h)/2)**2) {
+        r.taken = true; score += 1; updateScore();
+      }
+    }
+  }
+
+  function updateScore(){ scoreEl.textContent = score; }
+
+  // inimigos: movimento e colisão
+  function updateEnemies(dt) {
+    for (const e of enemies) {
+      if (!e.alive) continue;
+      e.x += e.dir * e.speed * dt;
+      // piscar boundaries simples
+      if (e.x < 200) e.dir = 1;
+      if (e.x > world.width - 300) e.dir = -1;
+      // colisão com plataformas (simples: para manter y)
+    }
+  }
+
+  // colisão jogador vs inimigo -> morte (reset)
+  function checkEnemyCollisions() {
+    for (const e of enemies) {
+      if (!e.alive) continue;
+      const pr = {x:player.x, y:player.y, w:player.w, h:player.h};
+      const er = {x:e.x, y:e.y, w:e.w, h:e.h};
+      if (rectsOverlap(pr, er)) {
+        // o pedido foi claro: tocar no inimigo mata o jogador
+        // respawn
+        player.x = 100; player.y = 200; player.vx = 0; player.vy = 0;
+        score = Math.max(0, score - 10); updateScore();
+      }
+    }
+  }
+
+  // --- Game loop ---
+  let last = performance.now();
+  function loop(now) {
+    const dt = Math.min(0.033, (now - last)/1000);
+    last = now;
+    update(dt);
+    render();
+    requestAnimationFrame(loop);
+  }
+
+  function update(dt) {
+    // Input/ aceleração com inércia (Sonic-like)
+    let ax = 0;
+    if (keys['ArrowLeft'] || keys['KeyA']) { ax -= MOVE_ACCEL; player.facing = -1; }
+    if (keys['ArrowRight'] || keys['KeyD']) { ax += MOVE_ACCEL; player.facing = 1; }
+
+    // jump
+    if ((keys['ArrowUp'] || keys['Space'] || keys['KeyW']) && player.onGround) {
+      player.vy = JUMP_V; player.onGround = false;
+    }
+
+    // aceleração
+    if (ax !== 0) {
+      player.vx += ax * dt;
+    } else {
+      // atrito
+      if (player.vx > 0) player.vx = Math.max(0, player.vx - FRICTION * dt);
+      else if (player.vx < 0) player.vx = Math.min(0, player.vx + FRICTION * dt);
+    }
+
+    // clamp
+    if (player.vx > MAX_SPEED) player.vx = MAX_SPEED;
+    if (player.vx < -MAX_SPEED) player.vx = -MAX_SPEED;
+
+    // gravity
+    player.vy += GRAVITY * dt;
+
+    // move & collisions
+    resolveCollisions(dt);
+
+    // anéis
+    collectRings();
+
+    // enemies
+    updateEnemies(dt);
+
+    // colisão com inimigos (mata)
+    checkEnemyCollisions();
+
+    // câmara segue
+    cameraX = player.x + player.w/2 - W/2;
+    cameraX = Math.max(0, Math.min(world.width - W, cameraX));
+
+    // atualiza estado de animação
+    if (!player.onGround) player.spriteState = 'jump';
+    else if (Math.abs(player.vx) > 30) player.spriteState = 'run';
+    else player.spriteState = 'idle';
+  }
+
+  // --- Render ---
+  function render() {
+    ctx.clearRect(0,0,W,H);
+    drawParallax();
+
+    ctx.save();
+    ctx.translate(-cameraX,0);
+
+    // plataformas
+    for (const p of platforms) drawPlatform(p);
+
+    // rings
+    for (const r of rings) { if (!r.taken) drawRing(r); }
+
+    // inimigos
+    for (const e of enemies) { if (e.alive) drawEnemy(e); }
+
+    // player (desenha Mario animado se ready, senão circle)
+    if (spriteReady) drawPlayerSprite(player);
+    else drawPlayerFallback(player);
+
+    ctx.restore();
+
+    drawSpeed();
+  }
+
+  function drawParallax(){
+    const cam = cameraX * 0.5;
+    for (let i=-1;i<6;i++){
+      const hx = (i*600) - (cam % 600);
+      ctx.beginPath();
+      ctx.fillStyle = "#2e8b57";
+      ctx.ellipse(hx+300,500,360,120,0,0,Math.PI*2);
+      ctx.fill();
+    }
+  }
+
+  function drawPlatform(p){
+    ctx.fillStyle = "#8B5A2B"; ctx.fillRect(p.x,p.y,p.w,p.h);
+    ctx.fillStyle = "rgba(255,255,255,0.08)"; ctx.fillRect(p.x+6,p.y+4,Math.max(0,p.w-12),Math.max(0,p.h-8));
+  }
+
+  function drawRing(r){
+    ctx.save(); ctx.translate(r.x, r.y);
+    const spin = (r.x * 0.03) % (Math.PI*2);
+    ctx.rotate(spin);
+    ctx.beginPath(); ctx.lineWidth = 6; ctx.strokeStyle = "#FFD700"; ctx.arc(0,0,r.r,0,Math.PI*2); ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawEnemy(e){
+    // desenho simples: caixa com olhos
+    ctx.save();
+    ctx.translate(e.x, e.y);
+    ctx.fillStyle = "#6b6b6b";
+    ctx.fillRect(0,0,e.w,e.h);
+    ctx.fillStyle = "#000";
+    ctx.fillRect(4,4,6,6);
+    ctx.fillRect(e.w - 10,4,6,6);
+    ctx.restore();
+  }
+
+  function drawPlayerFallback(p){
+    ctx.save();
+    ctx.fillStyle = "#0A84FF";
+    ctx.beginPath(); ctx.ellipse(p.x + p.w/2, p.y + p.h/2, 18,20,0,0,Math.PI*2); ctx.fill();
+    ctx.restore();
+  }
+
+  // Desenha Mario a partir do spritesheet
+  function drawPlayerSprite(p){
+    // resolve animação e frame (genérico)
+    const anim = anims[p.spriteState] || anims.idle;
+    // atualiza animFrame com base no tempo (usando performance.now)
+    // (usamos playAnim para atualizar timer/frame)
+    const dt = Math.min(0.033, (performance.now() - last)/1000);
+    const frameIndex = playAnim(p.spriteState, dt);
+    // desenha: supomos que frames estão na mesma linha (row)
+    // fonte: frameW x frameH, coluna = frameIndex, linha = anim.row
+    const sx = frameIndex * frameW;
+    const sy = (anim.row || 0) * frameH;
+    const dw = frameW * sheetScale;
+    const dh = frameH * sheetScale;
+    // centraliza no jogador
+    const dx = p.x + (p.w - dw)/2;
+    const dy = p.y + (p.h - dh);
+    ctx.save();
+    if (p.facing === -1) {
+      // espelha horizontalmente
+      ctx.translate(dx + dw/2 - cameraX, 0);
+      ctx.scale(-1,1);
+      ctx.drawImage(marioImg, sx, sy, frameW, frameH, -dw/2, dy, dw, dh);
+    } else {
+      ctx.drawImage(marioImg, sx, sy, frameW, frameH, dx, dy, dw, dh);
+    }
+    ctx.restore();
+  }
+
+  function drawSpeed(){
+    ctx.save();
+    ctx.fillStyle = "rgba(0,0,0,0.35)"; ctx.fillRect(8,8,160,40);
+    ctx.fillStyle = "#fff"; ctx.font = "16px system-ui, Arial";
+    ctx.fillText("Vel: " + Math.round(player.vx) + " px/s", 16, 34);
+    ctx.restore();
+  }
+
+  // start loop
+  requestAnimationFrame(loop);
+
+  // click to jump
+  canvas.addEventListener('click', () => { if (player.onGround) player.vy = JUMP_V; });
+
+  // expor para debug
+  window.__gameMario = {player, rings, platforms, enemies, world};
+
+  // instruções rápidas ao carregar sprite
+  marioImg.onerror = () => {
+    console.warn('Não foi possível carregar o spritesheet:', SPRITE_SRC);
+    console.warn('Coloca um ficheiro "mario.png" no mesmo diretório ou define SPRITE_SRC para um URL válido.');
+  };
+})();
+</script>
+</body>
+</html>
