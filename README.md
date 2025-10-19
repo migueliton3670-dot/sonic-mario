@@ -1,2 +1,7 @@
-# sonic-mario
-um sonic onde o protagonista é o Mário 
+echo "# sonic-mario" >> README.md
+git init
+git add README.md
+git commit -m "first commit"
+git branch -M main
+git remote add origin https://github.com/migueliton3670-dot/sonic-mario.git
+git push -u origin main
